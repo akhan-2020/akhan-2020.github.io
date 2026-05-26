@@ -3,210 +3,184 @@ layout: post
 title: "A Spring Boot Developer's Guide to Azure Container Apps"
 date: 2026-05-25
 categories: [java, azure]
-author: Azure Developer Relations
-excerpt: "Learn how to deploy Spring Boot applications to Azure Container Apps without managing Kubernetes infrastructure directly."
 ---
-
-**8 min read**
 
 ## Introduction
 
-Deploying containerized Spring Boot applications shouldn't require you to become a Kubernetes expert. Azure Container Apps provides a serverless container hosting platform that handles infrastructure management, auto-scaling, and ingress routing—letting you focus on writing Java code. With `az containerapp up`, you can deploy directly from source without writing Dockerfiles.
+Azure Container Apps provides a serverless container hosting platform that lets Spring Boot developers deploy containerized applications without managing Kubernetes clusters directly. If you've been looking for a simpler alternative to AKS that still gives you container flexibility with automatic scaling, ingress, and Azure service integration, Container Apps is worth exploring.
 
-This guide walks through deploying a Spring Boot application to Azure Container Apps, configuring health probes for Java's longer startup times, and integrating Spring Cloud Azure with Managed Identity for passwordless authentication to Azure services like App Configuration.
+This guide walks through deploying a Spring Boot application to Azure Container Apps, configuring health probes for Java's longer startup times, and integrating with Azure services using Managed Identity and Spring Cloud Azure. You'll learn practical patterns that work with your existing Spring Boot applications.
 
-## Architecture Overview
-
-Here's how the components work together:
+## Architecture
 
 ```mermaid
-flowchart TD
-    Dev[Spring Boot Developer] -->|mvn spring-boot:run| App[Spring Boot App<br/>Port 8080]
-    App -->|Spring Cloud Azure| MI[Managed Identity]
-    MI -->|Passwordless Auth| AppConfig[Azure App Configuration]
-    
-    Dev -->|az containerapp up| ACA[Azure Container Apps]
-    ACA -->|Auto-build & Deploy| ACR[Azure Container Registry]
-    ACA -->|Runs in| Env[Container Apps Environment]
-    ACA -->|Uses| MI
-    
-    ACA -->|Health Probes<br/>/actuator/health| App
-    Env -->|Ingress HTTPS| Internet[Internet Traffic]
+graph LR
+    A[Spring Boot App] -->|Deploy| B[Azure Container Apps]
+    B -->|Pull Image| C[Azure Container Registry]
+    B -->|Managed Identity| D[Spring Cloud Azure SDK]
+    D -->|Passwordless Auth| E[Azure Services]
+    B -->|HTTP Ingress| F[Public Endpoint]
 ```
-
-Your Spring Boot app runs locally for development, connects to Azure App Configuration via Managed Identity (using your Azure CLI credentials), and deploys to Container Apps with a single command.
 
 ## Prerequisites
 
-Before you begin, ensure you have:
-
-- **Java 21** or later installed
-- **Maven 3.8+** for building the project
-- **Azure CLI** (`az version` 2.50+)
-- An **Azure subscription** (run `az login` to authenticate)
-- Basic familiarity with Spring Boot and REST APIs
+- **Java 21** installed locally
+- **Maven 3.9+** for building the application
+- **Azure CLI** installed (`az version` to verify)
+- **Active Azure subscription** and logged in (`az login`)
+- Basic familiarity with Spring Boot and Docker concepts
 
 ## Understanding Azure Container Apps for Java Developers
 
-Azure Container Apps is built on Kubernetes but abstracts away the complexity. Key benefits for Spring Boot developers:
+Azure Container Apps sits between Azure App Service and Azure Kubernetes Service. You get container flexibility without writing Kubernetes YAML. The platform handles:
 
-- **No Dockerfile required**: `az containerapp up` builds containers automatically from source
-- **Built-in health probes**: Integrates with Spring Boot Actuator endpoints
-- **Auto-scaling**: Scales to zero when idle, up to 10+ replicas under load
-- **Managed Identity support**: Passwordless authentication to Azure services
-- **Pay-per-use pricing**: Only charged for resources consumed
+- **Automatic scaling** from zero to N replicas based on HTTP traffic or custom metrics
+- **Built-in ingress** with TLS termination and traffic splitting
+- **Managed environment** including service discovery and Dapr integration
+- **Container lifecycle** management with health probes and graceful shutdown
 
-Think of it as "Azure App Service for containers" with better scaling and portability.
+For Spring Boot developers, the key advantage is deploying containers using familiar tools while Azure manages the infrastructure.
 
-## Deploying Your First Spring Boot App
+## Deploying Your First Spring Boot App with az containerapp up
 
-Start by creating a minimal Spring Boot project with the required dependencies:
+The fastest path to deployment uses `az containerapp up`, which builds and deploys in one command:
 
-```java
-// pom.xml (key dependencies)
-<dependencies>
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-    
-    <dependency>
-        <groupId>com.azure.spring</groupId>
-        <artifactId>spring-cloud-azure-starter-appconfiguration</artifactId>
-    </dependency>
-</dependencies>
+```bash
+az containerapp up \
+  --name spring-demo-app \
+  --resource-group my-rg \
+  --location eastus \
+  --source . \
+  --ingress external \
+  --target-port 8080 \
+  --env-vars SPRING_PROFILES_ACTIVE=azure
 ```
 
-Create a simple REST controller to verify deployment:
+This command:
+- Creates a Container Apps environment if needed
+- Builds your Spring Boot JAR using Cloud Build
+- Pushes the image to Azure Container Registry
+- Deploys the container with external ingress on port 8080
+
+Your app is live in minutes without writing a Dockerfile.
+
+## Building Containers Without Docker Using Jib
+
+For production workflows, use Jib to build optimized container images directly from Maven:
+
+```xml
+<plugin>
+    <groupId>com.google.cloud.tools</groupId>
+    <artifactId>jib-maven-plugin</artifactId>
+    <version>3.4.0</version>
+    <configuration>
+        <to>
+            <image>myregistry.azurecr.io/spring-app:${project.version}</image>
+        </to>
+        <container>
+            <jvmFlags>
+                <jvmFlag>-Xms512m</jvmFlag>
+                <jvmFlag>-Xmx1024m</jvmFlag>
+            </jvmFlags>
+            <ports>
+                <port>8080</port>
+            </ports>
+        </container>
+    </configuration>
+</plugin>
+```
+
+Build and push without Docker daemon:
+
+```bash
+mvn compile jib:build \
+  -Djib.to.auth.username=00000000-0000-0000-0000-000000000000 \
+  -Djib.to.auth.password=$(az acr login --name myregistry --expose-token --query accessToken -o tsv)
+```
+
+## Configuring Health Probes for Java Applications
+
+Spring Boot applications often need 30-60 seconds to start. Configure startup, liveness, and readiness probes using Spring Boot Actuator:
 
 ```java
 @RestController
-public class ConfigController {
+public class HealthController {
     
-    @Value("${app.welcome.message:Default Welcome Message}")
-    private String welcomeMessage;
+    @GetMapping("/actuator/health/liveness")
+    public ResponseEntity<Map<String, String>> liveness() {
+        return ResponseEntity.ok(Map.of("status", "UP"));
+    }
     
-    @GetMapping("/")
-    public Map<String, String> home() {
-        return Map.of(
-            "message", welcomeMessage,
-            "status", "Running on Azure Container Apps!"
-        );
+    @GetMapping("/actuator/health/readiness")
+    public ResponseEntity<Map<String, String>> readiness() {
+        return ResponseEntity.ok(Map.of("status", "UP"));
     }
 }
 ```
 
-Deploy to Azure with a single command:
+Configure probes in your Container App:
 
 ```bash
-az containerapp up \
-  --name springboot-app \
-  --resource-group rg-springboot-demo \
-  --location eastus \
-  --source . \
-  --target-port 8080 \
-  --ingress external
+az containerapp update \
+  --name spring-demo-app \
+  --resource-group my-rg \
+  --startup-probe-type http \
+  --startup-probe-path /actuator/health/liveness \
+  --startup-probe-initial-delay 10 \
+  --startup-probe-period 5 \
+  --startup-probe-failure-threshold 12
 ```
 
-This command creates the Container Apps environment, builds your container, pushes to Azure Container Registry, and deploys—all in one step.
-
-## Configuring Health Probes for Java Applications
-
-Java applications take longer to start than lightweight Node.js or Go apps. Configure health probes with appropriate delays:
-
-```yaml
-# application.yml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info
-  endpoint:
-    health:
-      probes:
-        enabled: true
-      show-details: always
-
-server:
-  port: 8080
-  shutdown: graceful
-```
-
-In your Bicep template, set `initialDelaySeconds` to account for JVM startup:
-
-```bicep
-probes: [
-  {
-    type: 'liveness'
-    httpGet: {
-      path: '/actuator/health/liveness'
-      port: 8080
-    }
-    initialDelaySeconds: 60  // Give JVM time to start
-    periodSeconds: 10
-  }
-  {
-    type: 'readiness'
-    httpGet: {
-      path: '/actuator/health/readiness'
-      port: 8080
-    }
-    initialDelaySeconds: 30
-    periodSeconds: 5
-  }
-]
-```
+This gives your app 60 seconds (5s × 12) to start before Container Apps restarts it.
 
 ## Integrating Spring Cloud Azure with Managed Identity
 
-Spring Cloud Azure 5.x provides seamless integration with Azure services using Managed Identity. First, create Azure App Configuration:
+Use Managed Identity to authenticate to Azure services without managing credentials. First, add Spring Cloud Azure:
 
-```bash
-az appconfig create \
-  --name myappconfig \
-  --resource-group rg-springboot-demo \
-  --location eastus
-
-az appconfig kv set \
-  --name myappconfig \
-  --key app.welcome.message \
-  --value "Hello from Azure App Configuration!"
+```xml
+<dependency>
+    <groupId>com.azure.spring</groupId>
+    <artifactId>spring-cloud-azure-starter</artifactId>
+    <version>5.22.0</version>
+</dependency>
 ```
 
-Configure the Spring Cloud Azure starter:
+Configure in `application.yml`:
 
 ```yaml
-# application.yml
 spring:
   cloud:
     azure:
-      appconfiguration:
-        enabled: true
-        stores:
-          - endpoint: ${AZURE_APPCONFIG_ENDPOINT}
-            monitoring:
-              enabled: false
       credential:
         managed-identity-enabled: true
 ```
 
-When running locally, Azure SDK uses your `az login` credentials. In production, Container Apps uses the assigned Managed Identity—no connection strings or passwords required.
+Access Azure services using `DefaultAzureCredential`:
+
+```java
+@Configuration
+public class AzureConfig {
+    
+    @Bean
+    public BlobServiceClient blobServiceClient() {
+        return new BlobServiceClientBuilder()
+            .endpoint("https://mystorageaccount.blob.core.windows.net")
+            .credential(new DefaultAzureCredentialBuilder().build())
+            .buildClient();
+    }
+}
+```
+
+Assign the Managed Identity to your Container App and grant it permissions to Azure resources.
 
 ## Best Practices
 
-- **Use health probes correctly**: Set `initialDelaySeconds: 60` for liveness probes to accommodate JVM startup time
-- **Enable Managed Identity everywhere**: Avoid storing credentials in environment variables or configuration files
-- **Configure graceful shutdown**: Set `server.shutdown: graceful` to handle in-flight requests during scale-down
-- **Monitor with Log Analytics**: Container Apps environments automatically send logs to Log Analytics for troubleshooting
-- **Use `az containerapp up` for demos**: For production, use Bicep/Terraform for repeatable infrastructure-as-code deployments
+- **Use Jib or Buildpacks** for reproducible container builds without maintaining Dockerfiles
+- **Set appropriate resource limits** (0.5-1 CPU, 1-2GB memory) to control costs while ensuring Java heap fits
+- **Configure startup probes generously** for Spring Boot apps—use 60-90 second timeouts
+- **Leverage Managed Identity** for all Azure service authentication instead of connection strings
+- **Use Container Apps secrets** for non-Azure credentials, never hardcode in environment variables
 
 ## Summary
 
-Azure Container Apps provides a serverless, Kubernetes-based platform perfect for Spring Boot developers who want container portability without operational complexity. With `az containerapp up`, Spring Cloud Azure, and Managed Identity, you can build production-ready applications that authenticate securely to Azure services.
-
-Check out the complete sample application at [spring-boot-azure-container-apps-guide](https://github.com/Azure-Samples/spring-boot-azure-container-apps-guide) for working code, Bicep templates, and deployment scripts.
+Azure Container Apps provides Spring Boot developers with a serverless container platform that handles infrastructure while preserving container flexibility. By combining `az containerapp up` for rapid deployment, Jib for production builds, and Spring Cloud Azure for passwordless authentication, you can deploy production-ready applications without managing Kubernetes. Check out the companion repository for a complete working example you can run locally and deploy to Azure.
