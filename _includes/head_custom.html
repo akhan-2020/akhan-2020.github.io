@@ -1,0 +1,18 @@
+<!-- Mermaid.js: Renders architecture diagrams in blog posts -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
+    // Jekyll/kramdown renders ```mermaid blocks as .language-mermaid div wrappers.
+    // Transform them into <pre class="mermaid"> so Mermaid.js can render them.
+    document.querySelectorAll('.language-mermaid').forEach(function (container) {
+      var code = container.querySelector('code');
+      if (!code) return;
+      var pre = document.createElement('pre');
+      pre.className = 'mermaid';
+      pre.textContent = code.textContent;
+      container.replaceWith(pre);
+    });
+    mermaid.run();
+  });
+</script>
